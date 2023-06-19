@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"errors"
-	"fmt"
 	"math/big"
 	"strings"
 	"time"
@@ -75,7 +74,6 @@ func sendTxWithBackoff(
 ) error {
 	var (
 		isUnretryableError bool
-		proposedTime       = time.Unix(int64(proposedAt), 0)
 	)
 
 	if err := backoff.Retry(func() error {
@@ -120,42 +118,43 @@ func sendTxWithBackoff(
 			}
 
 			if needNewProof {
-				stateVar, err := cli.TaikoL1.GetStateVariables(nil)
-				if err != nil {
-					log.Warn("Failed to get protocol state variables", "blockID", blockID, "error", err)
-					return err
-				}
-
-				targetDelay := stateVar.ProofTimeTarget * 4
-				if stateVar.BlockFee != 0 {
-					targetDelay = uint64(float64(expectedReward) / float64(stateVar.BlockFee) * float64(stateVar.ProofTimeTarget))
-					if targetDelay < stateVar.ProofTimeTarget/4 {
-						targetDelay = stateVar.ProofTimeTarget / 4
-					} else if targetDelay > stateVar.ProofTimeTarget*4 {
-						targetDelay = stateVar.ProofTimeTarget * 4
+				// Comment out the code that calculates the target delay and checks if the current time is before the proposed time plus the target delay.
+				/*
+					stateVar, err := cli.TaikoL1.GetStateVariables(nil)
+					if err != nil {
+						log.Warn("Failed to get protocol state variables", "blockID", blockID, "error", err)
+						return err
 					}
-				}
 
-				log.Info(
-					"Target delay",
-					"blockID", blockID,
-					"delay", targetDelay,
-					"expectedReward", expectedReward,
-					"blockFee", stateVar.BlockFee,
-					"proofTimeTarget", stateVar.ProofTimeTarget,
-					"proposedTime", proposedTime,
-					"timeToWait", time.Until(proposedTime.Add(time.Duration(targetDelay)*time.Second)),
-				)
+					targetDelay := stateVar.ProofTimeTarget * 4
+					if stateVar.BlockFee != 0 {
+						targetDelay = uint64(float64(expectedReward) / float64(stateVar.BlockFee) * float64(stateVar.ProofTimeTarget))
+						if targetDelay < stateVar.ProofTimeTarget/4 {
+							targetDelay = stateVar.ProofTimeTarget / 4
+						} else if targetDelay > stateVar.ProofTimeTarget*4 {
+							targetDelay = stateVar.ProofTimeTarget * 4
+						}
+					}
 
-				if time.Now().Before(proposedTime.Add(time.Duration(targetDelay) * time.Second)) {
-					return errNeedWaiting
-				}
-			} else {
-				log.Info("Proof was submitted another prover, skip the current proof submission", "blockID", blockID)
-				return nil
+					log.Info(
+						"Target delay",
+						"blockID", blockID,
+						"delay", targetDelay,
+						"expectedReward", expectedReward,
+						"blockFee", stateVar.BlockFee,
+						"proofTimeTarget", stateVar.ProofTimeTarget,
+						"proposedTime", proposedTime,
+						"timeToWait", time.Until(proposedTime.Add(time.Duration(targetDelay)*time.Second)),
+					)
+
+					if time.Now().Before(proposedTime.Add(time.Duration(targetDelay) * time.Second)) {
+						return errNeedToWait
+					}
+				*/
 			}
 		}
 
+		// Attempt to send the transaction.
 		tx, err := sendTxFunc()
 		if err != nil {
 			err = encoding.TryParsingCustomError(err)
@@ -168,24 +167,34 @@ func sendTxWithBackoff(
 			return nil
 		}
 
-		if _, err := rpc.WaitReceipt(ctx, cli.L1, tx); err != nil {
-			log.Warn("Failed to wait till transaction executed", "blockID", blockID, "txHash", tx.Hash(), "error", err)
+		// Wait for the receipt of the transaction.
+		receipt, err := cli.L1.TransactionReceipt(ctx, tx.Hash())
+		if err != nil {
+			log.Warn(
+				"Failed to wait for the receipt of the transaction",
+				"blockID", blockID,
+				"txHash", tx.Hash(),
+				"error", err,
+			)
 			return err
 		}
 
-		log.Info(
-			"💰 Your block proof was accepted",
-			"blockID", blockID,
-			"proposedAt", proposedAt,
-		)
+		// Log a message indicating that the block proof was accepted.
+		if receipt.Status == types.ReceiptStatusSuccessful {
+			log.Info(
+				"Block proof accepted",
+				"blockID", blockID,
+				"txHash", tx.Hash(),
+			)
+		}
 
 		return nil
-	}, backoff.NewConstantBackOff(retryInterval)); err != nil {
-		return fmt.Errorf("failed to send TaikoL1.proveBlock transaction: %w", err)
-	}
+	}, backoff.NewExponentialBackOff()); err != nil {
+		if isUnretryableError {
+			return errUnretryable
+		}
 
-	if isUnretryableError {
-		return errUnretryable
+		return err
 	}
 
 	return nil
